@@ -60,13 +60,14 @@ export class ConsumerProxy implements Pulsar.Consumer {
     const message = await this.consumer.receive(timeout);
 
     // Postpone the span ending for the next time the user calls receive
-    this._lastSpan = extractSpanFromMessage(
+    const { span } = extractSpanFromMessage(
       this._tracer,
       this._instrumentationConfig,
       this._moduleVersion,
       this.config,
       message
     );
+    this._lastSpan = span;
     this._lastAttributes = getAttributesFromMessage(message);
     return message;
   }
@@ -145,7 +146,7 @@ function extractSpanFromMessage(
   moduleVersion: string | undefined,
   config: Pulsar.ConsumerConfig,
   message: Pulsar.Message
-) {
+): { span: api.Span; context: api.Context } {
   const remoteContext = api.propagation.extract(
     api.context.active(),
     message.getProperties()
@@ -169,9 +170,9 @@ function extractSpanFromMessage(
     remoteContext
   );
 
-  api.trace.setSpan(remoteContext, span);
+  const spanContext = api.trace.setSpan(remoteContext, span);
 
-  return span;
+  return { span, context: spanContext };
 }
 
 export function wrappedListener(
@@ -182,9 +183,9 @@ export function wrappedListener(
   listener: ConsumerListener
 ): ConsumerListener {
   return async (message: Pulsar.Message, consumer: Pulsar.Consumer) => {
-    const span = extractSpanFromMessage(tracer, instrumentationConfig, moduleVersion, config, message);
+    const { span, context: spanContext } = extractSpanFromMessage(tracer, instrumentationConfig, moduleVersion, config, message);
     try {
-      await callback(listener, message, consumer);
+      await api.context.with(spanContext, () => callback(listener, message, consumer));
     } catch (error) {
       span.recordException(error);
       span.setStatus({code: SpanStatusCode.ERROR});
