@@ -16,7 +16,7 @@
 import type * as Pulsar from 'pulsar-client';
 import type {ConsumerConfig} from 'pulsar-client';
 import * as api from '@opentelemetry/api';
-import {Attributes, Span, SpanStatusCode, Tracer} from '@opentelemetry/api';
+import {Attributes, Exception, Span, SpanStatusCode, Tracer} from '@opentelemetry/api';
 import {Instrumentation} from '../instrumentation';
 import {SemanticAttributes} from "@opentelemetry/semantic-conventions";
 import {PulsarInstrumentationConfig} from "../types";
@@ -31,7 +31,10 @@ type ConsumerListener = (
   consumer: Pulsar.Consumer
 ) => void | Promise<void>;
 
-export class ConsumerProxy implements Pulsar.Consumer {
+// Does not `implements Pulsar.Consumer` because receive() returns
+// PromiseLike instead of Promise, which is required for the custom
+// thenable pattern that activates OTel context on await.
+export class ConsumerProxy {
   private readonly _tracer: Tracer;
   private readonly _instrumentationConfig: PulsarInstrumentationConfig;
   private readonly _moduleVersion: string | undefined;
@@ -55,21 +58,53 @@ export class ConsumerProxy implements Pulsar.Consumer {
     this.consumer = consumer;
   }
 
-  async receive(timeout?: number): Promise<Pulsar.Message> {
-    this.closePreviousSpan();
-    const message = await this.consumer.receive(timeout);
+  /**
+   * Returns a custom thenable instead of a native Promise so that `await`
+   * calls our `.then()`, which wraps the continuation in
+   * `api.context.with()` — making the consumer span the active context
+   * for all code that runs after the await.
+   *
+   * This must NOT be an async function. An async function always returns a
+   * native Promise, even if the body returns a thenable. When V8 encounters
+   * `await nativePromise`, it resolves it via internal promise machinery
+   * (PerformPromiseThen) which reads the promise's internal slots directly,
+   * bypassing the `.then()` method on the object. Our custom `.then()` would
+   * never be called, and the span context would never be activated.
+   *
+   * By returning a plain thenable (an object with just a `.then` method),
+   * `await` treats it as a foreign thenable and explicitly calls `.then()`
+   * to resolve it — giving us the hook to wrap the continuation.
+   */
+  receive(timeout?: number): PromiseLike<Pulsar.Message> {
+    const innerPromise = this.consumer.receive(timeout).then(message => {
+      this.closePreviousSpan();
+      const { span, context: spanContext } = extractSpanFromMessage(
+        this._tracer,
+        this._instrumentationConfig,
+        this._moduleVersion,
+        this.config,
+        message
+      );
+      this._lastSpan = span;
+      this._lastAttributes = getAttributesFromMessage(message);
+      return { message, spanContext };
+    });
 
-    // Postpone the span ending for the next time the user calls receive
-    const { span } = extractSpanFromMessage(
-      this._tracer,
-      this._instrumentationConfig,
-      this._moduleVersion,
-      this.config,
-      message
-    );
-    this._lastSpan = span;
-    this._lastAttributes = getAttributesFromMessage(message);
-    return message;
+    return {
+      then: <TResult1 = Pulsar.Message, TResult2 = never>(
+        onFulfilled?:
+          | ((value: Pulsar.Message) => TResult1 | PromiseLike<TResult1>)
+          | null,
+        onRejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
+      ): PromiseLike<TResult1 | TResult2> =>
+        innerPromise.then(
+          ({ message, spanContext }) =>
+            onFulfilled
+              ? api.context.with(spanContext, () => onFulfilled(message))
+              : (message as unknown as TResult1),
+          onRejected
+        ),
+    };
   }
 
   private closePreviousSpan() {
@@ -187,7 +222,7 @@ export function wrappedListener(
     try {
       await api.context.with(spanContext, () => callback(listener, message, consumer));
     } catch (error) {
-      span.recordException(error);
+      span.recordException(error as Exception);
       span.setStatus({code: SpanStatusCode.ERROR});
       throw error;
     } finally {
