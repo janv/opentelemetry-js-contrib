@@ -83,7 +83,8 @@ export class ConsumerProxy {
         this._instrumentationConfig,
         this._moduleVersion,
         this.config,
-        message
+        message,
+        api.ROOT_CONTEXT
       );
       this._lastSpan = span;
       this._lastAttributes = getAttributesFromMessage(message);
@@ -180,10 +181,11 @@ function extractSpanFromMessage(
   instrumentationConfig: PulsarInstrumentationConfig,
   moduleVersion: string | undefined,
   config: Pulsar.ConsumerConfig,
-  message: Pulsar.Message
+  message: Pulsar.Message,
+  parentContext: api.Context = api.context.active()
 ): { span: api.Span; context: api.Context } {
   const remoteContext = api.propagation.extract(
-    api.context.active(),
+    parentContext,
     message.getProperties()
   );
 
